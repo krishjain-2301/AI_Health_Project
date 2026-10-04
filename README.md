@@ -7,6 +7,12 @@ and patients.
 
 It is a demo on a public research dataset, not a medical device.
 
+## Showreel
+
+[![HealthAI showreel: the dashboard, forecast, chat and model evaluation in 22 seconds](media/showreel.gif)](media/showreel.mp4)
+
+A 22-second tour of the dashboard. Click it for the [full-quality video with sound](media/showreel.mp4).
+
 ## What is in here
 
 | Folder | What it is |
