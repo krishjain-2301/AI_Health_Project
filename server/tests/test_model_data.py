@@ -4,7 +4,7 @@ import pandas as pd
 from api import cnn_model
 from api.cnn_model import (FEATURES, SEQUENCE_LENGTH, STEP_TARGET, ACTIVE_MINUTES_TARGET,
                            build_windows, check_anomalies, compute_metrics, is_low_activity,
-                           split_patients)
+                           patient_folds)
 
 
 def _patient(pid, steps, very_active=0, fairly_active=0):
@@ -25,7 +25,7 @@ def test_low_activity_needs_both_signals_low():
 
 
 def test_windows_label_the_next_day():
-    df = _patient(1, [9000, 9000, 9000, 2000, 9000])
+    df = _patient(1, [9000] * SEQUENCE_LENGTH + [2000, 9000])
     X, y, y_prev, groups = build_windows(df)
     assert X.shape == (2, SEQUENCE_LENGTH, len(FEATURES))
     assert y.tolist() == [1, 0]          # day 4 is low, day 5 is active
@@ -33,25 +33,31 @@ def test_windows_label_the_next_day():
     assert groups.tolist() == [1, 1]
 
 
-def test_days_not_worn_are_not_targets():
-    df = _patient(1, [9000, 9000, 9000, 0, 9000])
-    _, y, _, _ = build_windows(df)
-    assert y.tolist() == [0]             # the 0-step day is skipped as a target
+def test_days_not_worn_are_skipped():
+    df = _patient(1, [9000] * SEQUENCE_LENGTH + [0, 2000])
+    X, y, y_prev, _ = build_windows(df)
+    assert y.tolist() == [1]             # the 0-step day is neither a target nor an input
+    assert y_prev.tolist() == [0]
+    assert (X[0, :, FEATURES.index("TotalSteps")] > 0).all()
 
 
 def test_windows_never_span_two_patients():
-    df = pd.concat([_patient(1, [9000] * 3), _patient(2, [9000] * 3)])
+    n = SEQUENCE_LENGTH
+    df = pd.concat([_patient(1, [9000] * n), _patient(2, [9000] * n)])
     X, _, _, _ = build_windows(df)
-    assert len(X) == 0                   # 3 days each is not enough for a window + target
+    assert len(X) == 0                   # one window each, but no following day to forecast
 
 
-def test_split_is_by_patient_disjoint_and_deterministic():
-    ids = list(range(100, 133))
-    train, val, test = split_patients(ids)
-    assert set(train) | set(val) | set(test) == set(ids)
-    assert not (set(train) & set(test)) and not (set(train) & set(val)) and not (set(val) & set(test))
-    assert len(test) == 7 and len(val) == 5
-    assert split_patients(reversed(ids)) == (train, val, test)
+def test_folds_are_by_patient_disjoint_and_deterministic():
+    groups = np.repeat(np.arange(100, 133), 10)
+    y = (groups % 3 == 0).astype(int)
+    folds = patient_folds(groups, y)
+    assert len(folds) == cnn_model.N_FOLDS
+    for train_idx, test_idx in folds:
+        assert not set(groups[train_idx]) & set(groups[test_idx])
+    assert sorted(np.concatenate([test for _, test in folds])) == list(range(len(y)))   # each day scored once
+    again = patient_folds(groups, y)
+    assert all((a[1] == b[1]).all() for a, b in zip(folds, again))
 
 
 def test_metrics_report_the_at_risk_class():
@@ -76,11 +82,9 @@ def test_explanation_measures_change_against_typical_value(monkeypatch):
     predict = lambda batch: 1.0 - batch[:, :, steps].mean(axis=1)
     x = np.full((SEQUENCE_LENGTH, len(FEATURES)), 0.5, dtype=np.float32)
     x[:, steps] = 0.1
-    seq = [{"HeartRateMeasured": False, "WeightMeasured": True}] * SEQUENCE_LENGTH
+    seq = [{}] * SEQUENCE_LENGTH
     out = cnn_model.explain(predict, x, seq)
     assert out[0]["feature"] == "TotalSteps"
     assert out[0]["contribution_pct"] == 40.0        # low steps raise risk by 40 points
     assert all(e["contribution_pct"] == 0 for e in out[1:])
-    by_name = {e["feature"]: e for e in out}
-    assert by_name["AverageHeartrate"]["placeholder"] is True
-    assert by_name["WeightKg"]["placeholder"] is False
+    assert not any(e["placeholder"] for e in out)   # no model input is a placeholder

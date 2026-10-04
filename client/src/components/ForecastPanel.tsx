@@ -26,7 +26,7 @@ export default function ForecastPanel({ forecast, loading, error, useTinyML, onT
       <div className="card-head">
         <div>
           <h2>Tomorrow's activity forecast</h2>
-          <p className="sub">Read from the last 3 days the tracker was worn{basedOn && ` (${basedOn})`}</p>
+          <p className="sub">Read from the last 7 days the tracker was worn{basedOn && ` (${basedOn})`}</p>
         </div>
         <div className="segmented" role="group" aria-label="Model">
           <button className={!useTinyML ? 'active' : ''} aria-pressed={!useTinyML}

@@ -18,11 +18,14 @@ _lock = threading.RLock()
 _interpreter = None
 _report = None
 
-def _convert_and_save(keras_model):
+def _convert(keras_model) -> bytes:
     import tensorflow as tf
     converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]   # quantization for TinyML
-    tflite_model = converter.convert()
+    return converter.convert()
+
+def _convert_and_save(keras_model):
+    tflite_model = _convert(keras_model)
     with open(TFLITE_PATH, 'wb') as f:
         f.write(tflite_model)
     print(f"[tinyml] Converted and saved TFLite model ({len(tflite_model)//1024} KB)")
@@ -66,19 +69,29 @@ def get_interpreter():
         print("[tinyml] TFLite interpreter ready.")
         return _interpreter
 
+def _invoke(interpreter, batch: np.ndarray) -> np.ndarray:
+    batch = np.asarray(batch, dtype=np.float32)
+    out = np.zeros(len(batch), dtype=np.float32)
+    input_index  = interpreter.get_input_details()[0]['index']
+    output_index = interpreter.get_output_details()[0]['index']
+    for i, row in enumerate(batch):
+        interpreter.set_tensor(input_index, row[None, :, :])
+        interpreter.invoke()
+        out[i] = interpreter.get_tensor(output_index)[0][0]
+    return out
+
 def tflite_predict_fn(batch: np.ndarray) -> np.ndarray:
     """P(next day is low-activity) for a batch of scaled windows, one invoke per row."""
     interpreter = get_interpreter()
-    batch = np.asarray(batch, dtype=np.float32)
-    out = np.zeros(len(batch), dtype=np.float32)
     with _lock:
-        input_index  = interpreter.get_input_details()[0]['index']
-        output_index = interpreter.get_output_details()[0]['index']
-        for i, row in enumerate(batch):
-            interpreter.set_tensor(input_index, row[None, :, :])
-            interpreter.invoke()
-            out[i] = interpreter.get_tensor(output_index)[0][0]
-    return out
+        return _invoke(interpreter, batch)
+
+def _fold_predict_fn(keras_model):
+    """The same conversion applied to a cross-validation model, kept in memory."""
+    import tensorflow as tf
+    interpreter = tf.lite.Interpreter(model_content=_convert(keras_model))
+    interpreter.allocate_tensors()
+    return lambda batch: _invoke(interpreter, batch)
 
 def predict_tinyml(recent_sequence: list) -> dict:
     """
@@ -90,8 +103,8 @@ def predict_tinyml(recent_sequence: list) -> dict:
     return cnn_model.run_prediction(recent_sequence, tflite_predict_fn, MODEL_TYPE)
 
 def get_tflite_report() -> dict:
-    """Held-out metrics, size and speed of the TFLite model, plus how often it
-    agrees with the Keras model it was converted from. Computed once per run."""
+    """Cross-validated metrics, size and speed of the TFLite model, plus how often
+    it agrees with the Keras model it was converted from. Computed once per run."""
     global _report
     with _lock:
         if _report is not None:
@@ -99,11 +112,11 @@ def get_tflite_report() -> dict:
         if get_interpreter() is None:
             return {}
         data = cnn_model.get_dataset()
-        report = cnn_model.evaluate(tflite_predict_fn)
-        if not report:
+        if not data["folds"]:
             return {}
-        keras_prob  = cnn_model.keras_predict_fn(data["X_test"])
-        tflite_prob = tflite_predict_fn(data["X_test"])
+        keras_prob  = cnn_model.keras_out_of_fold()
+        tflite_prob = cnn_model.out_of_fold(_fold_predict_fn)
+        report = cnn_model.compute_metrics(data["y"], tflite_prob)
         report["agreement_pct"] = round(float(((keras_prob >= 0.5) == (tflite_prob >= 0.5)).mean()) * 100, 1)
         report["max_probability_diff"] = round(float(np.abs(keras_prob - tflite_prob).max()), 4)
         report["size_kb"] = round(os.path.getsize(TFLITE_PATH) / 1024, 1)

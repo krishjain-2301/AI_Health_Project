@@ -1,37 +1,45 @@
 import os
 import json
 import time
+import shutil
 import threading
 import numpy as np
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "saved_cnn_model.keras")
 META_PATH  = os.path.join(os.path.dirname(__file__), "saved_cnn_model.meta.json")
-SEQUENCE_LENGTH = 3
+# Models used only for scoring (one per cross-validation fold); rebuilt when missing
+FOLD_DIR   = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".cache", "cv_folds")
+SEQUENCE_LENGTH = 7
 SEED = 42
-# Bump when the label definition or the train/test split changes, so a model
+L2 = 0.03
+EPOCHS = 100
+N_FOLDS = 5
+# Bump when the label definition or the training setup changes, so a model
 # saved under the old definition is retrained instead of silently reused.
-LABEL_VERSION = 2
+LABEL_VERSION = 3
 
+# Heart rate and weight are left out: most people never recorded them, so they
+# would mostly be placeholder values.
 FEATURES = [
     "TotalSteps", "Calories", "TotalMinutesAsleep",
-    "AverageHeartrate", "WeightKg", "VeryActiveMinutes",
+    "VeryActiveMinutes", "FairlyActiveMinutes", "LightlyActiveMinutes",
     "SedentaryMinutes", "DailyAvgIntensity", "AvgMETs", "SleepQualityScore"
 ]
-SCALE = np.array([10000.0, 3000.0, 480.0, 100.0, 100.0, 60.0, 1440.0, 1.0, 20.0, 3.0], dtype=np.float32)
+SCALE = np.array([10000.0, 3000.0, 480.0, 60.0, 60.0, 300.0, 1440.0, 1.0, 20.0, 3.0], dtype=np.float32)
 
 FEATURE_INFO = {
     "TotalSteps":         {"label": "Daily steps",         "unit": "steps"},
     "Calories":           {"label": "Calories burned",     "unit": "kcal"},
     "TotalMinutesAsleep": {"label": "Sleep",               "unit": "min"},
-    "AverageHeartrate":   {"label": "Heart rate",          "unit": "bpm"},
-    "WeightKg":           {"label": "Weight",              "unit": "kg"},
     "VeryActiveMinutes":  {"label": "Very active minutes", "unit": "min"},
+    "FairlyActiveMinutes":  {"label": "Fairly active minutes",  "unit": "min"},
+    "LightlyActiveMinutes": {"label": "Lightly active minutes", "unit": "min"},
     "SedentaryMinutes":   {"label": "Sedentary time",      "unit": "min"},
     "DailyAvgIntensity":  {"label": "Average intensity",   "unit": ""},
     "AvgMETs":            {"label": "METs",                "unit": "METs"},
     "SleepQualityScore":  {"label": "Sleep restlessness",  "unit": ""},
 }
-# Model inputs that are placeholders when the flag column is False
+# Readings that are placeholders when the flag column is False
 PLACEHOLDER_FLAGS = {"AverageHeartrate": "HeartRateMeasured", "WeightKg": "WeightMeasured"}
 
 # ── Label ────────────────────────────────────────────────────────────────────
@@ -43,8 +51,8 @@ CLASS_NAMES = ["Active", "Low-activity"]   # index = label value; 1 is the at-ri
 LABEL_DESCRIPTION = (
     f"A day is 'Low-activity' when it has fewer than {STEP_TARGET:,} steps and fewer than "
     f"{ACTIVE_MINUTES_TARGET} very/fairly active minutes. The model reads the previous "
-    f"{SEQUENCE_LENGTH} days and forecasts the next day. Days the tracker was not worn "
-    "(0 steps) are not used as targets."
+    f"{SEQUENCE_LENGTH} days the tracker was worn and forecasts the next one. Days it was "
+    "not worn (0 steps) are skipped."
 )
 
 THRESHOLDS = {
@@ -61,6 +69,7 @@ THRESHOLDS = {
 _lock = threading.RLock()
 _model = None
 _dataset = None
+_fold_models = None
 _evaluation = None
 
 
@@ -94,7 +103,7 @@ def check_anomalies(recent_sequence: list) -> list:
 
 # ── Data ─────────────────────────────────────────────────────────────────────
 def build_windows(df):
-    """Slide a SEQUENCE_LENGTH-day window over each patient.
+    """Slide a SEQUENCE_LENGTH-day window over each patient's worn days.
 
     Returns X (scaled), y (1 = next day is low-activity), y_prev (label of the
     last input day, for the persistence baseline) and the patient id per window.
@@ -102,6 +111,8 @@ def build_windows(df):
     X, y, y_prev, groups = [], [], [], []
     for pid, group in df.groupby("Id"):
         group = group.sort_values("ActivityDate")
+        # Days the tracker was not worn describe the device, not the person
+        group = group[group["TotalSteps"].fillna(0) > 0]
         feats = np.stack([
             group[f].fillna(0).to_numpy(dtype=np.float32) if f in group.columns
             else np.zeros(len(group), dtype=np.float32)
@@ -111,8 +122,6 @@ def build_windows(df):
         active = (group["VeryActiveMinutes"].fillna(0) + group["FairlyActiveMinutes"].fillna(0)).to_numpy()
         for i in range(len(group) - SEQUENCE_LENGTH):
             t = i + SEQUENCE_LENGTH
-            if steps[t] == 0:
-                continue
             X.append(feats[i:t])
             y.append(int(is_low_activity(steps[t], active[t])))
             y_prev.append(int(is_low_activity(steps[t - 1], active[t - 1])))
@@ -124,16 +133,15 @@ def build_windows(df):
             np.array(y_prev, dtype=np.int64), np.array(groups))
 
 
-def split_patients(patient_ids, seed: int = SEED):
-    """Deterministic train / validation / test split BY PATIENT, so no person's
-    days appear on both sides of the evaluation."""
-    ids = np.array(sorted(set(int(p) for p in patient_ids)))
-    np.random.RandomState(seed).shuffle(ids)
-    n = len(ids)
-    n_test = max(1, round(n * 0.20)) if n >= 3 else 0
-    n_val  = max(1, round(n * 0.15)) if n >= 3 else 0
-    test, val, train = ids[:n_test], ids[n_test:n_test + n_val], ids[n_test + n_val:]
-    return sorted(train.tolist()), sorted(val.tolist()), sorted(test.tolist())
+def patient_folds(groups, y, seed: int = SEED):
+    """Deterministic cross-validation folds BY PATIENT: all of a person's days
+    fall in one fold, so every day is scored by a model that never saw that person."""
+    from sklearn.model_selection import StratifiedGroupKFold
+    n_splits = min(N_FOLDS, len(set(np.asarray(groups).tolist())))
+    if n_splits < 2:
+        return []
+    cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    return list(cv.split(np.zeros(len(y)), y, groups))
 
 
 def get_dataset():
@@ -147,37 +155,36 @@ def get_dataset():
         if len(X) == 0:
             _dataset = {"empty": True}
             return _dataset
-        train_ids, val_ids, test_ids = split_patients(groups)
-        m_train, m_val, m_test = (np.isin(groups, ids) for ids in (train_ids, val_ids, test_ids))
         _dataset = {
             "empty": False,
-            "X_train": X[m_train], "y_train": y[m_train],
-            "X_val":   X[m_val],   "y_val":   y[m_val],
-            "X_test":  X[m_test],  "y_test":  y[m_test], "y_prev_test": y_prev[m_test],
-            "train_ids": train_ids, "val_ids": val_ids, "test_ids": test_ids,
-            # Typical (training-set mean) value of each feature, in scaled units
-            "feature_baseline": X[m_train].mean(axis=(0, 1)),
+            "X": X, "y": y, "y_prev": y_prev, "groups": groups,
+            "folds": patient_folds(groups, y),
+            # Typical (mean) value of each feature, in scaled units
+            "feature_baseline": X.mean(axis=(0, 1)),
         }
         return _dataset
 
 
 # ── Model ────────────────────────────────────────────────────────────────────
-def _build_model():
+def _build_model(X_train):
+    # Deliberately tiny and heavily regularised: with a few hundred windows from
+    # ~20 people, a larger network memorises the training patients and scores
+    # below the baselines on unseen ones.
     from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import Input, Conv1D, MaxPooling1D, Flatten, Dense, Dropout, BatchNormalization
+    from tensorflow.keras.layers import Input, Normalization, Conv1D, Flatten, Dense, Dropout
+    from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras.regularizers import l2
+    norm = Normalization(axis=-1)
+    norm.adapt(X_train)
     model = Sequential([
         Input(shape=(SEQUENCE_LENGTH, len(FEATURES))),
-        Conv1D(64, kernel_size=2, activation="relu"),
-        BatchNormalization(),
-        MaxPooling1D(pool_size=1),
-        Dropout(0.3),
-        Conv1D(32, kernel_size=1, activation="relu"),
+        norm,
+        Conv1D(8, kernel_size=3, activation="relu", kernel_regularizer=l2(L2)),
         Flatten(),
-        Dense(64, activation="relu"),
-        Dropout(0.2),
-        Dense(1, activation="sigmoid")
+        Dropout(0.3),
+        Dense(1, activation="sigmoid", kernel_regularizer=l2(L2))
     ])
-    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+    model.compile(optimizer=Adam(3e-3), loss="binary_crossentropy", metrics=["accuracy"])
     return model
 
 
@@ -197,29 +204,29 @@ def _saved_model_is_current() -> bool:
     return all(meta.get(k) == v for k, v in _expected_meta().items())
 
 
-def _train(data):
+def _fit(X, y):
     import tensorflow as tf
     tf.keras.utils.set_random_seed(SEED)
-    print("\n[cnn_model] Training CNN model")
-    print(f"[cnn_model]   Train: {len(data['X_train'])} windows / {len(data['train_ids'])} patients")
-    print(f"[cnn_model]   Val  : {len(data['X_val'])} windows / {len(data['val_ids'])} patients")
-    print(f"[cnn_model]   Test : {len(data['X_test'])} windows / {len(data['test_ids'])} patients (held out)")
-    model = _build_model()
-    stop = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=12, restore_best_weights=True)
+    model = _build_model(X)
     # Low-activity days are the minority; without weighting the model mostly
-    # predicts "Active" and misses them (chosen on validation F1, not test).
-    p = float(data["y_train"].mean())
+    # predicts "Active" and misses them.
+    p = float(y.mean())
     class_weight = {0: 0.5 / (1 - p), 1: 0.5 / p} if 0 < p < 1 else None
-    history = model.fit(data["X_train"], data["y_train"],
-                        validation_data=(data["X_val"], data["y_val"]),
-                        epochs=100, batch_size=32, verbose=0, callbacks=[stop],
-                        class_weight=class_weight)
+    model.fit(X, y, epochs=EPOCHS, batch_size=32, verbose=0, class_weight=class_weight)
+    return model
+
+
+def _train(data):
+    print("\n[cnn_model] Training CNN model")
+    print(f"[cnn_model]   {len(data['X'])} windows / {len(np.unique(data['groups']))} patients")
+    model = _fit(data["X"], data["y"])
     model.save(MODEL_PATH)
     meta = _expected_meta()
-    meta.update({"trained_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                 "epochs_run": len(history.history["loss"])})
+    meta.update({"trained_at": time.strftime("%Y-%m-%d %H:%M:%S"), "epochs_run": EPOCHS})
     with open(META_PATH, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
+    # The scoring models belong to the previous setup
+    shutil.rmtree(FOLD_DIR, ignore_errors=True)
     print(f"[cnn_model] CNN trained ({meta['epochs_run']} epochs) and saved to disk.")
     return model
 
@@ -246,16 +253,62 @@ def get_model():
                 print(f"[cnn_model] Saved model unusable, retraining: {e}")
                 _model = None
         else:
-            print("[cnn_model] No saved model for the current label/split, training...")
+            print("[cnn_model] No saved model for the current setup, training...")
         if _model is None:
             _model = _train(data)
         return _model
 
 
+def _keras_fn(model):
+    return lambda batch: model(np.asarray(batch, dtype=np.float32), training=False).numpy().reshape(-1)
+
+
 def keras_predict_fn(batch: np.ndarray) -> np.ndarray:
     """P(next day is low-activity) for a batch of scaled windows."""
-    model = get_model()
-    return model(np.asarray(batch, dtype=np.float32), training=False).numpy().reshape(-1)
+    return _keras_fn(get_model())(batch)
+
+
+def get_fold_models() -> list:
+    """One model per cross-validation fold, trained without that fold's patients.
+    They are only used to score the approach; forecasts come from get_model()."""
+    global _fold_models
+    with _lock:
+        if _fold_models is not None:
+            return _fold_models
+        data = get_dataset()
+        if data["empty"] or get_model() is None:
+            return []
+        import tensorflow as tf
+        paths = [os.path.join(FOLD_DIR, f"fold_{i}.keras") for i in range(len(data["folds"]))]
+        models = None
+        if all(os.path.exists(p) for p in paths):
+            try:
+                models = [tf.keras.models.load_model(p) for p in paths]
+            except Exception as e:
+                print(f"[cnn_model] Saved fold models unusable, retraining: {e}")
+        if models is None:
+            print(f"[cnn_model] Training {len(paths)} cross-validation models...")
+            os.makedirs(FOLD_DIR, exist_ok=True)
+            models = []
+            for path, (train_idx, _) in zip(paths, data["folds"]):
+                models.append(_fit(data["X"][train_idx], data["y"][train_idx]))
+                models[-1].save(path)
+        _fold_models = models
+        return _fold_models
+
+
+def out_of_fold(make_predict_fn) -> np.ndarray:
+    """P(low-activity) for every window, each from the fold model that never saw
+    its patient. make_predict_fn turns a fold's Keras model into a predict function."""
+    data = get_dataset()
+    prob = np.zeros(len(data["y"]), dtype=np.float32)
+    for model, (_, test_idx) in zip(get_fold_models(), data["folds"]):
+        prob[test_idx] = make_predict_fn(model)(data["X"][test_idx])
+    return prob
+
+
+def keras_out_of_fold() -> np.ndarray:
+    return out_of_fold(_keras_fn)
 
 
 # ── Evaluation ───────────────────────────────────────────────────────────────
@@ -288,20 +341,12 @@ def compute_metrics(y_true, y_prob) -> dict:
     return metrics
 
 
-def evaluate(predict_fn) -> dict:
-    """Score predict_fn on the held-out test patients."""
-    data = get_dataset()
-    if data["empty"] or len(data["X_test"]) == 0:
-        return {}
-    return compute_metrics(data["y_test"], predict_fn(data["X_test"]))
-
-
 def measure_latency_ms(predict_fn, runs: int = 40) -> float:
     """Median single-sample inference time. Indicative only (this machine, warm)."""
     data = get_dataset()
-    if data["empty"] or len(data["X_test"]) == 0:
+    if data["empty"]:
         return 0.0
-    sample = data["X_test"][:1]
+    sample = data["X"][:1]
     predict_fn(sample)
     times = []
     for _ in range(runs):
@@ -312,19 +357,20 @@ def measure_latency_ms(predict_fn, runs: int = 40) -> float:
 
 
 def get_evaluation() -> dict:
-    """Held-out evaluation of the Keras CNN, computed once per server run."""
+    """Cross-validated evaluation of the Keras CNN, computed once per server run."""
     global _evaluation
     with _lock:
         if _evaluation is not None:
             return _evaluation
         data = get_dataset()
-        if data["empty"] or get_model() is None:
+        if data["empty"] or not data["folds"] or get_model() is None:
             return {}
-        y_test, y_train = data["y_test"], data["y_train"]
-        majority = int(round(float(y_train.mean())))
-        keras = evaluate(keras_predict_fn)
+        y = data["y"]
+        majority = int(round(float(y.mean())))
+        keras = compute_metrics(y, keras_out_of_fold())
         keras["size_kb"] = round(os.path.getsize(MODEL_PATH) / 1024, 1)
         keras["latency_ms"] = measure_latency_ms(keras_predict_fn)
+        n_patients = int(len(np.unique(data["groups"])))
         _evaluation = {
             "label": {
                 "description": LABEL_DESCRIPTION,
@@ -336,22 +382,21 @@ def get_evaluation() -> dict:
             "features": [FEATURE_INFO[f]["label"] for f in FEATURES],
             "sequence_length": SEQUENCE_LENGTH,
             "split": {
-                "method": "by patient",
-                "train_patients": len(data["train_ids"]), "train_windows": int(len(data["X_train"])),
-                "val_patients":   len(data["val_ids"]),   "val_windows":   int(len(data["X_val"])),
-                "test_patients":  len(data["test_ids"]),  "test_windows":  int(len(data["X_test"])),
-                "test_patient_ids": data["test_ids"],
-                "test_low_activity_share": round(float(y_test.mean()), 4) if len(y_test) else 0.0,
+                "method": "cross-validation by patient",
+                "folds": len(data["folds"]),
+                "patients": n_patients,
+                "windows": int(len(y)),
+                "low_activity_share": round(float(y.mean()), 4),
             },
             "baselines": {
-                "majority":    compute_metrics(y_test, np.full(len(y_test), float(majority))),
-                "persistence": compute_metrics(y_test, data["y_prev_test"].astype(float)),
+                "majority":    compute_metrics(y, np.full(len(y), float(majority))),
+                "persistence": compute_metrics(y, data["y_prev"].astype(float)),
             },
             "keras": keras,
         }
-        print(f"[cnn_model] Held-out evaluation: accuracy={keras['accuracy']:.3f} "
+        print(f"[cnn_model] Cross-validated evaluation: accuracy={keras['accuracy']:.3f} "
               f"f1={keras['f1']:.3f} on {keras['test_samples']} windows "
-              f"from {len(data['test_ids'])} unseen patients.")
+              f"from {n_patients} patients, each scored by a model that never saw them.")
         return _evaluation
 
 
@@ -359,8 +404,8 @@ def get_evaluation() -> dict:
 def _sequence_to_array(recent_sequence: list) -> np.ndarray:
     arr = [[
         s.get("TotalSteps", 0), s.get("Calories", 0),
-        s.get("TotalMinutesAsleep", 0), s.get("AverageHeartrate", 72),
-        s.get("WeightKg", 70), s.get("VeryActiveMinutes", 0),
+        s.get("TotalMinutesAsleep", 0), s.get("VeryActiveMinutes", 0),
+        s.get("FairlyActiveMinutes", 0), s.get("LightlyActiveMinutes", 0),
         s.get("SedentaryMinutes", 0), s.get("DailyAvgIntensity", 0),
         s.get("AvgMETs", 10), s.get("SleepQualityScore", 1),
     ] for s in recent_sequence]

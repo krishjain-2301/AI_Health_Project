@@ -89,10 +89,9 @@ export interface ModelInfo {
   features: string[];
   sequence_length: number;
   split: {
-    train_patients: number; train_windows: number;
-    val_patients: number; val_windows: number;
-    test_patients: number; test_windows: number;
-    test_low_activity_share: number;
+    method: string; folds: number;
+    patients: number; windows: number;
+    low_activity_share: number;
   };
   baselines: { majority: Metrics; persistence: Metrics };
   keras: Metrics;

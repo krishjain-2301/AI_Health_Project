@@ -63,18 +63,20 @@ built-in keyword answers, and the sidebar says which mode it is in.
    day. Only 14 of 33 people have heart-rate data and 8 have weight, so each row
    records whether those values were measured or filled with a placeholder. The
    dashboard and chat show "not recorded" rather than the placeholder.
-2. **Forecast** (`server/api/cnn_model.py`): a small 1D CNN reads the last 3
-   days the tracker was worn and gives the probability that the next day is a
+2. **Forecast** (`server/api/cnn_model.py`): a very small 1D CNN reads the last
+   7 days the tracker was worn and gives the probability that the next day is a
    *low-activity day* (under 7,500 steps and under 30 very/fairly active
-   minutes).
-3. **Evaluation**: people are split into train / validation / test groups
-   (21 / 5 / 7), so the reported scores come from people the model never saw.
-   Scores are shown next to two simple baselines.
+   minutes). Heart rate and weight are not model inputs, because most people
+   never recorded them.
+3. **Evaluation**: 5-fold cross-validation by person. Each person's days are
+   scored by a model trained without that person, so the reported scores come
+   from people the model never saw. Scores are shown next to two simple
+   baselines. The model that serves forecasts is trained on everyone.
 4. **Explanation**: for each forecast, every input is swapped for its typical
    value in turn; the change in probability is that input's contribution.
 5. **TinyML** (`server/api/tinyml_model.py`): the CNN is converted to a
-   quantized TFLite model, rebuilt whenever the CNN changes, and scored on the
-   same test set for accuracy, size and speed.
+   quantized TFLite model, rebuilt whenever the CNN changes, and scored the
+   same way for accuracy, size and speed.
 6. **Chat** (`server/api/chat_routes.py`): Gemini or Claude answers from the
    selected person's data and forecast, with conversation history; falls back
    to rules when no key is set or the API call fails.
@@ -99,9 +101,13 @@ python -m pytest tests
 
 ## Known limits
 
-- The forecast is weak. On the held-out people it scores about the same as
-  always guessing "Active"; three days of data from 21 people is not much to
-  learn from. The dashboard shows this rather than hiding it.
-- With 7 test people, the scores move noticeably with the random seed.
+- The forecast is modest: about 72% accuracy, F1 0.67 and ROC AUC 0.79 on
+  people it never saw. Always guessing "Active" scores 61%, and "tomorrow will
+  be like today" scores 71% (F1 0.63, AUC 0.70), so the model's edge is mostly
+  in catching more low-activity days and ranking risk better, not in raw
+  accuracy. 636 days from 32 people is not much to learn from, and even knowing
+  each person's usual pattern would only reach about 77%.
+- One of the 33 people has too few worn days for a 7-day window and is not
+  scored. For anyone with fewer than 7 worn days the earliest day is repeated.
 - The last day in the dataset is a partial day for most people, which is why the
   charts drop at the right edge.

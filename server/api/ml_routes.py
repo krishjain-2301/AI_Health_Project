@@ -2,7 +2,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List
 from api import cnn_model
-from api.cnn_model import predict_health_trajectory, FEATURES, PLACEHOLDER_FLAGS, STEP_TARGET, ACTIVE_MINUTES_TARGET
+from api.cnn_model import (predict_health_trajectory, FEATURES, PLACEHOLDER_FLAGS, SEQUENCE_LENGTH,
+                           STEP_TARGET, ACTIVE_MINUTES_TARGET)
 from api.dataset_merger import process_and_merge_datasets
 from api.tinyml_model import predict_tinyml, get_tflite_report
 
@@ -15,6 +16,8 @@ class DayData(BaseModel):
     AverageHeartrate: float = 72.0
     WeightKg: float = 70.0
     VeryActiveMinutes: float = 0
+    FairlyActiveMinutes: float = 0
+    LightlyActiveMinutes: float = 0
     SedentaryMinutes: float = 0
     DailyAvgIntensity: float = 0
     AvgMETs: float = 10.0
@@ -27,12 +30,11 @@ class HealthRequest(BaseModel):
     use_tinyml: bool = False
 
 def _pad_sequence(seq_dicts: list) -> list:
-    pad = {"TotalSteps":0,"Calories":0,"TotalMinutesAsleep":0,
-           "AverageHeartrate":72,"WeightKg":70,"VeryActiveMinutes":0,
-           "SedentaryMinutes":0,"DailyAvgIntensity":0,"AvgMETs":10,"SleepQualityScore":1}
-    while len(seq_dicts) < 3:
+    # Too few days: repeat the earliest one rather than inventing zero-step days
+    pad = {k: v for k, v in seq_dicts[0].items() if k != "date"}
+    while len(seq_dicts) < SEQUENCE_LENGTH:
         seq_dicts.insert(0, pad.copy())
-    return seq_dicts[-3:]
+    return seq_dicts[-SEQUENCE_LENGTH:]
 
 def recent_sequence_for_patient(patient_id: int) -> list:
     """The patient's latest days as model input, with the measured/placeholder flags."""
@@ -40,10 +42,11 @@ def recent_sequence_for_patient(patient_id: int) -> list:
     patient_df = df[df["Id"] == patient_id].sort_values("ActivityDate")
     # Skip days the tracker was not worn (0 steps): they describe the device, not the person
     worn = patient_df[patient_df["TotalSteps"] > 0]
-    patient_df = (worn if len(worn) else patient_df).tail(3)
+    patient_df = (worn if len(worn) else patient_df).tail(SEQUENCE_LENGTH)
     seq = []
     for _, row in patient_df.iterrows():
-        day = {f: float(row[f]) for f in FEATURES}
+        # Heart rate and weight are not model inputs, but the range check reads them
+        day = {f: float(row[f]) for f in list(FEATURES) + list(PLACEHOLDER_FLAGS)}
         for flag in PLACEHOLDER_FLAGS.values():
             day[flag] = bool(row[flag])
         day["date"] = str(row["ActivityDate"]).split(" ")[0]

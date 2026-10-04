@@ -23,8 +23,8 @@ export default function ModelPanel({ info, useTinyML }: { info: ModelInfo; useTi
         <div>
           <h2>How good is the forecast?</h2>
           <p className="sub">
-            Scored on {split.test_windows} days from {split.test_patients} patients the model never saw in
-            training (trained on {split.train_patients}, tuned on {split.val_patients}).
+            Scored on {split.windows} days from {split.patients} patients by {split.folds}-fold
+            cross-validation: each patient's days are scored by a model that never saw that patient.
           </p>
         </div>
       </div>
