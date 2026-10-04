@@ -1,0 +1,19 @@
+{
+  "label_version": 2,
+  "features": [
+    "TotalSteps",
+    "Calories",
+    "TotalMinutesAsleep",
+    "AverageHeartrate",
+    "WeightKg",
+    "VeryActiveMinutes",
+    "SedentaryMinutes",
+    "DailyAvgIntensity",
+    "AvgMETs",
+    "SleepQualityScore"
+  ],
+  "sequence_length": 3,
+  "seed": 42,
+  "trained_at": "2026-10-04 11:59:18",
+  "epochs_run": 26
+}

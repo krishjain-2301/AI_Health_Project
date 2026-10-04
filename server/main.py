@@ -1,14 +1,46 @@
+import os
+import threading
+from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
+# Load server/.env (GEMINI_API_KEY etc.) before the routers read the environment.
+# override=True: a key in this project's .env wins over one left in the system
+# environment, which may be stale.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from api import data_routes, ml_routes, chat_routes
 
-app = FastAPI(title="AI Health Project API", description="Server for Health Analyzing Web Application")
+_ready = threading.Event()
+
+def _warm_up():
+    """Load the dataset and both models once, in the background, so the first
+    dashboard request does not pay for it. Requests that arrive early simply
+    wait on the same locks."""
+    try:
+        from api import cnn_model, tinyml_model
+        cnn_model.get_evaluation()
+        tinyml_model.get_tflite_report()
+    except Exception as e:
+        print(f"[startup] Warm-up error: {e}")
+    finally:
+        _ready.set()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    threading.Thread(target=_warm_up, daemon=True).start()
+    yield
+
+app = FastAPI(title="AI Health Project API", description="Server for Health Analyzing Web Application",
+              lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174", "http://localhost:5175", "http://127.0.0.1:5175", "http://localhost:5176", "http://127.0.0.1:5176"],
+    # Any local dev port (Vite picks 5173, 5174, ... depending on what is free)
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -24,7 +56,7 @@ def read_root():
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "models_ready": _ready.is_set()}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
