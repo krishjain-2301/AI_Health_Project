@@ -1,8 +1,10 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List
-from api.cnn_model import predict_health_trajectory
-from api.tinyml_model import predict_tinyml
+from api import cnn_model
+from api.cnn_model import predict_health_trajectory, FEATURES, PLACEHOLDER_FLAGS, STEP_TARGET, ACTIVE_MINUTES_TARGET
+from api.dataset_merger import process_and_merge_datasets
+from api.tinyml_model import predict_tinyml, get_tflite_report
 
 router = APIRouter()
 
@@ -20,7 +22,8 @@ class DayData(BaseModel):
 
 class HealthRequest(BaseModel):
     patient_id: int
-    recent_sequence: List[DayData]
+    # Optional: when omitted the server uses the patient's most recent days
+    recent_sequence: List[DayData] = []
     use_tinyml: bool = False
 
 def _pad_sequence(seq_dicts: list) -> list:
@@ -31,27 +34,69 @@ def _pad_sequence(seq_dicts: list) -> list:
         seq_dicts.insert(0, pad.copy())
     return seq_dicts[-3:]
 
+def recent_sequence_for_patient(patient_id: int) -> list:
+    """The patient's latest days as model input, with the measured/placeholder flags."""
+    df = process_and_merge_datasets()
+    patient_df = df[df["Id"] == patient_id].sort_values("ActivityDate")
+    # Skip days the tracker was not worn (0 steps): they describe the device, not the person
+    worn = patient_df[patient_df["TotalSteps"] > 0]
+    patient_df = (worn if len(worn) else patient_df).tail(3)
+    seq = []
+    for _, row in patient_df.iterrows():
+        day = {f: float(row[f]) for f in FEATURES}
+        for flag in PLACEHOLDER_FLAGS.values():
+            day[flag] = bool(row[flag])
+        day["date"] = str(row["ActivityDate"]).split(" ")[0]
+        seq.append(day)
+    return seq
+
+def predict_for_patient(patient_id: int, use_tinyml: bool = False) -> dict:
+    seq = recent_sequence_for_patient(patient_id)
+    if not seq:
+        return {}
+    seq = _pad_sequence(seq)
+    return predict_tinyml(seq) if use_tinyml else predict_health_trajectory(seq)
+
 @router.post("/predict_consequences")
 def predict_health(data: HealthRequest):
-    seq_dicts = [d.model_dump() for d in data.recent_sequence]
+    if data.recent_sequence:
+        seq_dicts = [d.model_dump() for d in data.recent_sequence]
+    else:
+        seq_dicts = recent_sequence_for_patient(data.patient_id)
+        if not seq_dicts:
+            raise HTTPException(status_code=404, detail=f"Patient {data.patient_id} not found")
     seq_dicts = _pad_sequence(seq_dicts)
+
     try:
         result = predict_tinyml(seq_dicts) if data.use_tinyml else predict_health_trajectory(seq_dicts)
-        consequences = []
-        if isinstance(result, dict) and "risk_level" in result:
-            label = result.get("model_type", "CNN Pattern Analysis")
-            if result["risk_level"] == "High":
-                consequences.append({
-                    "factor": label, "risk": "High",
-                    "description": f"High-risk trajectory detected ({result["confidence_pct"]}% confidence). Patient trending toward sedentary habits with cardiovascular and metabolic risk."
-                })
-            else:
-                consequences.append({
-                    "factor": label, "risk": "Low",
-                    "description": f"Healthy trajectory detected ({result["confidence_pct"]}% confidence). Activity and caloric levels are adequate to minimize long-term risk."
-                })
-        else:
-            consequences.append({"factor": "Model Error", "risk": "Unknown", "description": str(result)})
-        return {"predictions": consequences}
     except Exception as e:
-        return {"predictions": [{"factor": "Prediction Fault", "risk": "Unknown", "description": str(e)}]}
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+    if "risk_level" not in result:
+        raise HTTPException(status_code=503, detail=result.get("error", "Model not available."))
+    result["based_on"] = [d["date"] for d in seq_dicts if d.get("date")]
+
+    target = f"{STEP_TARGET:,} steps or {ACTIVE_MINUTES_TARGET} active minutes"
+    if result["risk_level"] == "High":
+        description = (f"The model expects tomorrow to be a low-activity day "
+                       f"({result['risk_probability_pct']}% probability), falling short of {target}.")
+    else:
+        description = (f"The model expects tomorrow to meet the activity target of {target} "
+                       f"({round(100 - result['risk_probability_pct'], 1)}% probability).")
+    consequences = [{"factor": "Next-day activity forecast", "risk": result["risk_level"],
+                     "description": description}]
+    for a in result["anomalies"]:
+        consequences.append({
+            "factor": f"Out of range: {a['label']}",
+            "risk": "High",
+            "description": a["message"]
+        })
+
+    return {"predictions": consequences, "raw": result}
+
+@router.get("/model_info")
+def model_info():
+    """How the model was built and how it scores on patients it never trained on."""
+    info = cnn_model.get_evaluation()
+    if not info:
+        raise HTTPException(status_code=503, detail="Model not available.")
+    return {**info, "tflite": get_tflite_report()}
